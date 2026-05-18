@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from contextlib import contextmanager
 import os
 import random
 import string
@@ -20,10 +21,14 @@ BANNER_VALUE = "Banner:Banner:True"
 BANNER_CODES = {"bob", "freez1x", "nezz", "pinpin", "sabry"}
 
 # ── DATABASE ─────────────────────────────────────────────────────
+@contextmanager
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode="disable")
+    conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def init_db():
     with get_db() as conn:
