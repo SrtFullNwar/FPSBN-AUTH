@@ -14,6 +14,8 @@ CORS(app)
 # ── CONFIG ──────────────────────────────────────────────────────
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "ton_mot_de_passe_admin")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 MAX_LOGS     = 200
 
 CODE_VALUE   = "Fpsbn:Fpsbn:True"
@@ -216,7 +218,7 @@ def config_save():
         return jsonify({"ok": False, "reason": "ip_mismatch"})
     if is_expired(row["expires_at"]):
         return jsonify({"ok": False, "reason": "expired"})
-    if len(config) > 8000:
+    if len(config) > 20000:
         return jsonify({"ok": False, "reason": "config_too_large"})
     with get_db() as conn:
         with conn.cursor() as cur:
