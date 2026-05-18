@@ -30,18 +30,23 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS codes (
-                    code_id     TEXT PRIMARY KEY,
-                    value       TEXT NOT NULL,
-                    locked_ip   TEXT,
-                    player_name TEXT,
-                    fivem_name  TEXT,
-                    first_seen  TIMESTAMPTZ,
-                    last_seen   TIMESTAMPTZ,
-                    expires_at  TIMESTAMPTZ,
-                    banner      TEXT DEFAULT '',
-                    theme       TEXT DEFAULT '',
-                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                    code_id        TEXT PRIMARY KEY,
+                    value          TEXT NOT NULL,
+                    locked_ip      TEXT,
+                    player_name    TEXT,
+                    fivem_name     TEXT,
+                    first_seen     TIMESTAMPTZ,
+                    last_seen      TIMESTAMPTZ,
+                    expires_at     TIMESTAMPTZ,
+                    duration_days  INTEGER,
+                    banner         TEXT DEFAULT '',
+                    theme          TEXT DEFAULT '',
+                    lua_config     TEXT DEFAULT '',
+                    created_at     TIMESTAMPTZ DEFAULT NOW()
                 );
+                -- Migrations : ajouter les colonnes si elles n'existent pas encore
+                ALTER TABLE codes ADD COLUMN IF NOT EXISTS duration_days INTEGER;
+                ALTER TABLE codes ADD COLUMN IF NOT EXISTS lua_config TEXT DEFAULT '';
                 CREATE TABLE IF NOT EXISTS banned_ips (
                     ip TEXT PRIMARY KEY,
                     banned_at TIMESTAMPTZ DEFAULT NOW()
@@ -99,15 +104,17 @@ def load_all_codes():
     codes = {}
     for row in rows:
         codes[row["code_id"]] = {
-            "locked_ip":   row["locked_ip"],
-            "player_name": row["player_name"],
-            "fivem_name":  row["fivem_name"],
-            "first_seen":  row["first_seen"].isoformat() if row["first_seen"] else None,
-            "last_seen":   row["last_seen"].isoformat()  if row["last_seen"]  else None,
-            "expires_at":  row["expires_at"].isoformat() if row["expires_at"] else None,
-            "banner":      row["banner"] or "",
-            "theme":       row["theme"]  or "",
-            "created_at":  row["created_at"].isoformat() if row["created_at"] else None,
+            "locked_ip":     row["locked_ip"],
+            "player_name":   row["player_name"],
+            "fivem_name":    row["fivem_name"],
+            "first_seen":    row["first_seen"].isoformat() if row["first_seen"] else None,
+            "last_seen":     row["last_seen"].isoformat()  if row["last_seen"]  else None,
+            "expires_at":    row["expires_at"].isoformat() if row["expires_at"] else None,
+            "duration_days": row["duration_days"],
+            "banner":        row["banner"] or "",
+            "theme":         row["theme"]  or "",
+            "lua_config":    row["lua_config"] or "",
+            "created_at":    row["created_at"].isoformat() if row["created_at"] else None,
         }
     return codes
 
@@ -181,7 +188,48 @@ def check():
     if row["locked_ip"] and row["locked_ip"] != ip:
         add_log("CHECK_FAIL", f"IP mismatch — attendu {row['locked_ip']}, reçu {ip}", ip=ip, code=code_id)
         return jsonify({"ok": False, "reason": "ip_mismatch"})
-    return jsonify({"ok": True, "banner": row["banner"] or "", "theme": row["theme"] or "", "ip": ip})
+    return jsonify({"ok": True, "banner": row["banner"] or "", "theme": row["theme"] or "", "ip": ip, "lua_config": row["lua_config"] or ""})
+
+
+@app.route("/config/save", methods=["POST"])
+def config_save():
+    """Sauvegarde la config Lua pour une key donnée."""
+    body    = request.get_json(force=True) or {}
+    code_id = (body.get("code") or "").strip()
+    config  = body.get("config") or ""
+    ip      = get_real_ip()
+    if not code_id:
+        return jsonify({"ok": False, "reason": "missing_fields"})
+    row = get_code_row(code_id)
+    if not row:
+        return jsonify({"ok": False, "reason": "invalid_code"})
+    if row["locked_ip"] and row["locked_ip"] != ip:
+        return jsonify({"ok": False, "reason": "ip_mismatch"})
+    if is_expired(row["expires_at"]):
+        return jsonify({"ok": False, "reason": "expired"})
+    if len(config) > 8000:
+        return jsonify({"ok": False, "reason": "config_too_large"})
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE codes SET lua_config = %s WHERE code_id = %s", (config, code_id))
+    return jsonify({"ok": True})
+
+
+@app.route("/config/load", methods=["GET"])
+def config_load():
+    """Charge la config Lua d'une key."""
+    code_id = (request.args.get("code") or "").strip()
+    ip      = get_real_ip()
+    if not code_id:
+        return jsonify({"ok": False, "reason": "missing_fields"})
+    row = get_code_row(code_id)
+    if not row:
+        return jsonify({"ok": False, "reason": "invalid_code"})
+    if row["locked_ip"] and row["locked_ip"] != ip:
+        return jsonify({"ok": False, "reason": "ip_mismatch"})
+    if is_expired(row["expires_at"]):
+        return jsonify({"ok": False, "reason": "expired"})
+    return jsonify({"ok": True, "config": row["lua_config"] or ""})
 
 
 @app.route("/claim", methods=["POST"])
@@ -202,6 +250,13 @@ def claim():
         return jsonify({"ok": False, "reason": "taken"})
     is_first = not row["locked_ip"]
     now_dt   = datetime.utcnow()
+
+    # ── Timer démarre à la 1ère utilisation ──────────────────────────
+    computed_expires = None
+    if is_first and row["duration_days"]:
+        from datetime import timezone, timedelta
+        computed_expires = datetime.now(timezone.utc) + timedelta(days=row["duration_days"])
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -210,9 +265,11 @@ def claim():
                     first_seen  = COALESCE(first_seen, %s),
                     last_seen   = %s,
                     player_name = COALESCE(%s, player_name),
-                    fivem_name  = COALESCE(%s, fivem_name)
+                    fivem_name  = COALESCE(%s, fivem_name),
+                    expires_at  = CASE WHEN locked_ip IS NULL AND %s IS NOT NULL THEN %s ELSE expires_at END
                 WHERE code_id = %s
-            """, (ip, now_dt, now_dt, player_name or None, fivem_name or None, code_id))
+            """, (ip, now_dt, now_dt, player_name or None, fivem_name or None,
+                  computed_expires, computed_expires, code_id))
     display = fivem_name or player_name or code_id
     action  = "FIRST_CONNECTION" if is_first else "CONNECTION"
     label   = "1ère connexion" if is_first else "Reconnexion"
@@ -225,8 +282,13 @@ def generate():
     body = request.get_json(force=True) or {}
     if not check_secret(body):
         return jsonify({"ok": False, "reason": "unauthorized"}), 403
-    count     = min(int(body.get("count", 1)), 20)
-    expires   = body.get("expires_at") or None
+    count         = min(int(body.get("count", 1)), 20)
+    duration_days = body.get("duration_days")   # None = illimité
+    if duration_days is not None:
+        try:
+            duration_days = int(duration_days)
+        except Exception:
+            duration_days = None
     generated = []
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -236,8 +298,10 @@ def generate():
                     cur.execute("SELECT 1 FROM codes WHERE code_id = %s", (code_id,))
                     if not cur.fetchone():
                         break
-                cur.execute("INSERT INTO codes (code_id, value, expires_at, created_at) VALUES (%s, %s, %s, NOW())",
-                            (code_id, CODE_VALUE, expires))
+                cur.execute(
+                    "INSERT INTO codes (code_id, value, duration_days, created_at) VALUES (%s, %s, %s, NOW())",
+                    (code_id, CODE_VALUE, duration_days)
+                )
                 generated.append(code_id)
     add_log("ADMIN_GENERATE", f"{len(generated)} code(s): {', '.join(['CODE_'+c for c in generated])}", admin=True)
     return jsonify({"ok": True, "codes": generated})
@@ -253,12 +317,19 @@ def add():
         return jsonify({"ok": False, "reason": "missing_code"})
     if code_exists(code_id):
         return jsonify({"ok": False, "reason": "already_exists"})
-    value   = BANNER_VALUE if code_id in BANNER_CODES else CODE_VALUE
-    expires = body.get("expires_at") or None
+    value         = BANNER_VALUE if code_id in BANNER_CODES else CODE_VALUE
+    duration_days = body.get("duration_days")
+    if duration_days is not None:
+        try:
+            duration_days = int(duration_days)
+        except Exception:
+            duration_days = None
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO codes (code_id, value, expires_at, created_at) VALUES (%s, %s, %s, NOW())",
-                        (code_id, value, expires))
+            cur.execute(
+                "INSERT INTO codes (code_id, value, duration_days, created_at) VALUES (%s, %s, %s, NOW())",
+                (code_id, value, duration_days)
+            )
     add_log("ADMIN_ADD", f"Code créé: CODE_{code_id} = {value}", admin=True)
     return jsonify({"ok": True, "code": code_id})
 
@@ -316,13 +387,23 @@ def edit():
     code_id = (body.get("code") or "").strip()
     if not code_exists(code_id):
         return jsonify({"ok": False, "reason": "code_not_found"})
-    expires = body.get("expires_at") or None
-    banner  = body.get("banner")
-    theme   = body.get("theme")
+    banner        = body.get("banner")
+    theme         = body.get("theme")
+    duration_days = body.get("duration_days")
+    if duration_days is not None:
+        try:
+            duration_days = int(duration_days)
+        except Exception:
+            duration_days = None
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE codes SET expires_at=%s, banner=COALESCE(%s,banner), theme=COALESCE(%s,theme) WHERE code_id=%s",
-                        (expires, banner, theme, code_id))
+            cur.execute("""
+                UPDATE codes SET
+                    duration_days = COALESCE(%s, duration_days),
+                    banner        = COALESCE(%s, banner),
+                    theme         = COALESCE(%s, theme)
+                WHERE code_id = %s
+            """, (duration_days, banner, theme, code_id))
     add_log("ADMIN_EDIT", "Code modifié", code=code_id, admin=True)
     return jsonify({"ok": True})
 
