@@ -198,7 +198,7 @@ def check():
     return jsonify({"ok": True, "banner": row["banner"] or "", "theme": row["theme"] or "", "ip": ip, "lua_config": row["lua_config"] or ""})
 
 
-@app.route("/config/save", methods=["GET", "POST"])
+@app.route("/cfg/save", methods=["GET", "POST"])
 def config_save():
     """Sauvegarde la config Lua pour une key donnée (GET ou POST)."""
     if request.method == "POST":
@@ -226,7 +226,7 @@ def config_save():
     return jsonify({"ok": True})
 
 
-@app.route("/config/load", methods=["GET"])
+@app.route("/cfg/load", methods=["GET"])
 def config_load():
     """Charge la config Lua d'une key."""
     code_id = (request.args.get("code") or "").strip()
