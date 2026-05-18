@@ -191,13 +191,17 @@ def check():
     return jsonify({"ok": True, "banner": row["banner"] or "", "theme": row["theme"] or "", "ip": ip, "lua_config": row["lua_config"] or ""})
 
 
-@app.route("/config/save", methods=["POST"])
+@app.route("/config/save", methods=["GET", "POST"])
 def config_save():
-    """Sauvegarde la config Lua pour une key donnée."""
-    body    = request.get_json(force=True) or {}
-    code_id = (body.get("code") or "").strip()
-    config  = body.get("config") or ""
-    ip      = get_real_ip()
+    """Sauvegarde la config Lua pour une key donnée (GET ou POST)."""
+    if request.method == "POST":
+        body    = request.get_json(force=True) or {}
+        code_id = (body.get("code") or "").strip()
+        config  = body.get("config") or ""
+    else:
+        code_id = (request.args.get("code") or "").strip()
+        config  = (request.args.get("config") or "")
+    ip = get_real_ip()
     if not code_id:
         return jsonify({"ok": False, "reason": "missing_fields"})
     row = get_code_row(code_id)
