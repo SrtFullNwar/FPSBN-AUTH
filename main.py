@@ -218,8 +218,16 @@ def check():
     
     # Validation du HWID (prioritaire si verrouillé ou fourni)
     if "locked_hwid" in row and row["locked_hwid"] and row["locked_hwid"] != hwid:
-        add_log("CHECK_FAIL", f"HWID mismatch — attendu {row['locked_hwid']}, reçu {hwid or 'aucun'}", ip=ip, code=code_id)
-        return jsonify({"ok": False, "reason": "hwid_mismatch"})
+        # Si l'IP de la requête correspond parfaitement à l'IP déjà verrouillée,
+        # on accepte la connexion et on met à jour le HWID automatiquement (auto-correction FiveM)
+        if row["locked_ip"] and row["locked_ip"] == ip:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE codes SET locked_hwid = %s WHERE code_id = %s", (hwid or None, code_id))
+            add_log("AUTO_HWID_UPDATE", f"HWID mis à jour automatiquement (IP correspondante)", ip=ip, code=code_id)
+        else:
+            add_log("CHECK_FAIL", f"HWID mismatch — attendu {row['locked_hwid']}, reçu {hwid or 'aucun'}", ip=ip, code=code_id)
+            return jsonify({"ok": False, "reason": "hwid_mismatch"})
     
     # Repli sur l'IP si aucun HWID n'est verrouillé (compatibilité ascendante)
     elif ("locked_hwid" not in row or not row["locked_hwid"]) and row["locked_ip"] and row["locked_ip"] != ip:
