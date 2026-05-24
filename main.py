@@ -54,6 +54,7 @@ def init_db():
                 -- Migrations : ajouter les colonnes si elles n'existent pas encore
                 ALTER TABLE codes ADD COLUMN IF NOT EXISTS duration_days INTEGER;
                 ALTER TABLE codes ADD COLUMN IF NOT EXISTS lua_config TEXT DEFAULT '';
+                ALTER TABLE codes ADD COLUMN IF NOT EXISTS locked_hwid TEXT;
                 CREATE TABLE IF NOT EXISTS banned_ips (
                     ip TEXT PRIMARY KEY,
                     banned_at TIMESTAMPTZ DEFAULT NOW()
@@ -112,6 +113,7 @@ def load_all_codes():
     for row in rows:
         codes[row["code_id"]] = {
             "locked_ip":     row["locked_ip"],
+            "locked_hwid":   row["locked_hwid"] if "locked_hwid" in row else None,
             "player_name":   row["player_name"],
             "fivem_name":    row["fivem_name"],
             "first_seen":    row["first_seen"].isoformat() if row["first_seen"] else None,
@@ -179,6 +181,7 @@ def status():
 @app.route("/check", methods=["GET"])
 def check():
     code_id = (request.args.get("code") or "").strip()
+    hwid    = (request.args.get("hwid") or "").strip()
     ip      = get_real_ip()
     if not code_id:
         return jsonify({"ok": False, "reason": "missing_fields"})
@@ -192,12 +195,21 @@ def check():
     if is_expired(row["expires_at"]):
         add_log("CHECK_FAIL", "Code expiré", ip=ip, code=code_id)
         return jsonify({"ok": False, "reason": "expired"})
-    if row["locked_ip"] and row["locked_ip"] != ip:
+    
+    # Validation du HWID (prioritaire si verrouillé ou fourni)
+    if "locked_hwid" in row and row["locked_hwid"] and row["locked_hwid"] != hwid:
+        add_log("CHECK_FAIL", f"HWID mismatch — attendu {row['locked_hwid']}, reçu {hwid or 'aucun'}", ip=ip, code=code_id)
+        return jsonify({"ok": False, "reason": "hwid_mismatch"})
+    
+    # Repli sur l'IP si aucun HWID n'est verrouillé (compatibilité ascendante)
+    elif ("locked_hwid" not in row or not row["locked_hwid"]) and row["locked_ip"] and row["locked_ip"] != ip:
         add_log("CHECK_FAIL", f"IP mismatch — attendu {row['locked_ip']}, reçu {ip}", ip=ip, code=code_id)
         return jsonify({"ok": False, "reason": "ip_mismatch"})
+        
     return jsonify({"ok": True, "banner": row["banner"] or "", "theme": row["theme"] or "", "ip": ip, "lua_config": row["lua_config"] or ""})
 
 
+@app.route("/config/save", methods=["GET", "POST"])
 @app.route("/cfg/save", methods=["GET", "POST"])
 def config_save():
     """Sauvegarde la config Lua pour une key donnée (GET ou POST)."""
@@ -218,7 +230,7 @@ def config_save():
         return jsonify({"ok": False, "reason": "ip_mismatch"})
     if is_expired(row["expires_at"]):
         return jsonify({"ok": False, "reason": "expired"})
-    if len(config) > 20000:
+    if len(config) > 8000:
         return jsonify({"ok": False, "reason": "config_too_large"})
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -226,6 +238,7 @@ def config_save():
     return jsonify({"ok": True})
 
 
+@app.route("/config/load", methods=["GET"])
 @app.route("/cfg/load", methods=["GET"])
 def config_load():
     """Charge la config Lua d'une key."""
@@ -249,6 +262,7 @@ def claim():
     code_id     = (body.get("code")        or "").strip()
     player_name = (body.get("player_name") or "").strip()
     fivem_name  = (body.get("fivem_name")  or "").strip()
+    hwid        = (body.get("hwid")        or "").strip()
     ip          = get_real_ip()
     if not code_id:
         return jsonify({"ok": False, "reason": "missing_fields"})
@@ -257,9 +271,16 @@ def claim():
         return jsonify({"ok": False, "reason": "invalid_code"})
     if ip in get_banned_ips():
         return jsonify({"ok": False, "reason": "ip_banned"})
-    if row["locked_ip"] and row["locked_ip"] != ip:
+    
+    # Validation du verrouillage HWID (si déjà verrouillé)
+    if "locked_hwid" in row and row["locked_hwid"] and row["locked_hwid"] != hwid:
         return jsonify({"ok": False, "reason": "taken"})
-    is_first = not row["locked_ip"]
+    
+    # Validation IP de secours (si pas de HWID et IP verrouillée)
+    if ("locked_hwid" not in row or not row["locked_hwid"]) and row["locked_ip"] and row["locked_ip"] != ip:
+        return jsonify({"ok": False, "reason": "taken"})
+        
+    is_first = not row["locked_ip"] and ("locked_hwid" not in row or not row["locked_hwid"])
     now_dt   = datetime.utcnow()
 
     # ── Timer démarre à la 1ère utilisation ──────────────────────────
@@ -273,13 +294,14 @@ def claim():
             cur.execute("""
                 UPDATE codes SET
                     locked_ip   = COALESCE(locked_ip, %s),
+                    locked_hwid = COALESCE(locked_hwid, %s),
                     first_seen  = COALESCE(first_seen, %s),
                     last_seen   = %s,
                     player_name = COALESCE(%s, player_name),
                     fivem_name  = COALESCE(%s, fivem_name),
-                    expires_at  = CASE WHEN locked_ip IS NULL AND %s IS NOT NULL THEN %s ELSE expires_at END
+                    expires_at  = CASE WHEN locked_ip IS NULL AND locked_hwid IS NULL AND %s IS NOT NULL THEN %s ELSE expires_at END
                 WHERE code_id = %s
-            """, (ip, now_dt, now_dt, player_name or None, fivem_name or None,
+            """, (ip, hwid or None, now_dt, now_dt, player_name or None, fivem_name or None,
                   computed_expires, computed_expires, code_id))
     display = fivem_name or player_name or code_id
     action  = "FIRST_CONNECTION" if is_first else "CONNECTION"
@@ -368,11 +390,12 @@ def reset():
     if not row:
         return jsonify({"ok": False, "reason": "code_not_found"})
     old_ip   = row["locked_ip"] or "—"
+    old_hwid = row.get("locked_hwid") or "—"
     old_name = row["fivem_name"] or row["player_name"] or "—"
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE codes SET locked_ip=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL WHERE code_id=%s", (code_id,))
-    add_log("ADMIN_RESET", f"Libéré — était: {old_name} / {old_ip}", code=code_id, admin=True)
+            cur.execute("UPDATE codes SET locked_ip=NULL, locked_hwid=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL WHERE code_id=%s", (code_id,))
+    add_log("ADMIN_RESET", f"Libéré — était: {old_name} / {old_ip} / HWID: {old_hwid}", code=code_id, admin=True)
     return jsonify({"ok": True})
 
 
@@ -383,10 +406,10 @@ def reset_all():
         return jsonify({"ok": False, "reason": "unauthorized"}), 403
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE codes SET locked_ip=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL")
+            cur.execute("UPDATE codes SET locked_ip=NULL, locked_hwid=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL")
             cur.execute("SELECT COUNT(*) FROM codes")
             count = cur.fetchone()[0]
-    add_log("ADMIN_RESET_ALL", f"Reset global — {count} codes libérés", admin=True)
+    add_log("ADMIN_RESET_ALL", f"Reset global — {count} codes libérés (IP & HWID)", admin=True)
     return jsonify({"ok": True})
 
 
