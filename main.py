@@ -14,8 +14,6 @@ CORS(app)
 # ── CONFIG ──────────────────────────────────────────────────────
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "ton_mot_de_passe_admin")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 MAX_LOGS     = 200
 
 CODE_VALUE   = "Fpsbn:Fpsbn:True"
@@ -178,6 +176,28 @@ def status():
     return jsonify({"ok": True, "codes": load_all_codes(), "banned_ips": get_banned_ips(), "logs": load_logs()})
 
 
+@app.route("/lookup", methods=["GET"])
+def lookup():
+    """Retrouve le code associé à l'IP courante (reconnexion automatique)."""
+    ip = get_real_ip()
+    if not ip:
+        return jsonify({"ok": False, "reason": "no_ip"})
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT code_id, player_name, fivem_name FROM codes WHERE locked_ip=%s LIMIT 1",
+                    (ip,)
+                )
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "reason": "not_found"})
+        display_name = row["fivem_name"] or row["player_name"] or ""
+        return jsonify({"ok": True, "code": row["code_id"], "player_name": display_name})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": "server_error"})
+
+
 @app.route("/check", methods=["GET"])
 def check():
     code_id = (request.args.get("code") or "").strip()
@@ -210,7 +230,6 @@ def check():
 
 
 @app.route("/config/save", methods=["GET", "POST"])
-@app.route("/cfg/save", methods=["GET", "POST"])
 def config_save():
     """Sauvegarde la config Lua pour une key donnée (GET ou POST)."""
     if request.method == "POST":
@@ -239,7 +258,6 @@ def config_save():
 
 
 @app.route("/config/load", methods=["GET"])
-@app.route("/cfg/load", methods=["GET"])
 def config_load():
     """Charge la config Lua d'une key."""
     code_id = (request.args.get("code") or "").strip()
@@ -396,6 +414,42 @@ def reset():
         with conn.cursor() as cur:
             cur.execute("UPDATE codes SET locked_ip=NULL, locked_hwid=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL WHERE code_id=%s", (code_id,))
     add_log("ADMIN_RESET", f"Libéré — était: {old_name} / {old_ip} / HWID: {old_hwid}", code=code_id, admin=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/reset-ip", methods=["POST"])
+def reset_ip():
+    body = request.get_json(force=True) or {}
+    if not check_secret(body):
+        return jsonify({"ok": False, "reason": "unauthorized"}), 403
+    code_id = (body.get("code") or "").strip()
+    row = get_code_row(code_id)
+    if not row:
+        return jsonify({"ok": False, "reason": "code_not_found"})
+    old_ip   = row["locked_ip"] or "—"
+    old_name = row["fivem_name"] or row["player_name"] or "—"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE codes SET locked_ip=NULL, player_name=NULL, fivem_name=NULL, first_seen=NULL, last_seen=NULL WHERE code_id=%s", (code_id,))
+    add_log("ADMIN_RESET_IP", f"IP Libérée — était: {old_name} / {old_ip}", code=code_id, admin=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/reset-hwid", methods=["POST"])
+def reset_hwid():
+    body = request.get_json(force=True) or {}
+    if not check_secret(body):
+        return jsonify({"ok": False, "reason": "unauthorized"}), 403
+    code_id = (body.get("code") or "").strip()
+    row = get_code_row(code_id)
+    if not row:
+        return jsonify({"ok": False, "reason": "code_not_found"})
+    old_hwid = row.get("locked_hwid") or "—"
+    old_name = row["fivem_name"] or row["player_name"] or "—"
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE codes SET locked_hwid=NULL WHERE code_id=%s", (code_id,))
+    add_log("ADMIN_RESET_HWID", f"HWID Libéré — était: {old_name} / HWID: {old_hwid}", code=code_id, admin=True)
     return jsonify({"ok": True})
 
 
