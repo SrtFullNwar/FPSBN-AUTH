@@ -300,7 +300,13 @@ def claim():
     
     # Validation du verrouillage HWID (si déjà verrouillé)
     if "locked_hwid" in row and row["locked_hwid"] and row["locked_hwid"] != hwid:
-        return jsonify({"ok": False, "reason": "taken"})
+        # Si l'IP actuelle correspond à l'IP verrouillée, on met à jour le HWID automatiquement
+        if row["locked_ip"] and row["locked_ip"] == ip:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE codes SET locked_hwid = %s WHERE code_id = %s", (hwid or None, code_id))
+        else:
+            return jsonify({"ok": False, "reason": "taken"})
     
     # Validation IP de secours (si pas de HWID et IP verrouillée)
     if ("locked_hwid" not in row or not row["locked_hwid"]) and row["locked_ip"] and row["locked_ip"] != ip:
